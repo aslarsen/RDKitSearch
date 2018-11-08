@@ -5,13 +5,21 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem import rdMolTransforms
 from rdkit.Chem import PDBWriter
-from rdkit.Chem import MolFromPDBFile
+from rdkit.Chem import MolToPDBBlock
+from rdkit.Chem import MolFromPDBBlock
 import time
 import multiprocessing
 import multiprocessing.pool
 import sys
 import copy
-
+try:
+    import qmxtb
+except:
+    print ('qmxtb not available')
+try:
+    import qmgaussian
+except:
+    print ('qmgaussian not available')
 
 def optimise_multiprocessing(jobs):
     count = 0
@@ -55,6 +63,9 @@ class Conformer:
         elif method == "gaussian": 
             self.optimise_gaussian(name) # energy is updated in optimise_gaussian()
             self.dihedrals = [ angle[4] for angle in self.get_dihedrals() ]
+        elif method == "xtb":
+            self.optimise_xtb(name)
+            self.dihedrals = [ angle[4] for angle in self.get_dihedrals() ]
         else:
             print ('ERROR INVALID METHOD')
 
@@ -69,11 +80,49 @@ class Conformer:
 
         self.energy = ff.CalcEnergy()
 
+    def optimise_xtb(self, filename = "test"):
+        """
+        Optimise molecule with xtb
+        """
+        # first do minimisation with MMFF94 and dihedrals contrainted
+        # this will hopefully fix clashes
+        mp = AllChem.MMFFGetMoleculeProperties(self.molecule, mmffVariant="MMFF94")
+        ff = AllChem.MMFFGetMoleculeForceField(self.molecule, mp)
+
+        current_angles = self.get_dihedrals()
+        N = 0
+        for angle in current_angles:
+            ff.MMFFAddTorsionConstraint(angle[0], angle[1], angle[2], angle[3], False, angle[4], angle[4], 500000.0)
+            N += 1
+
+        ff.Minimize(maxIts=500,forceTol=0.0001,energyTol=1e-06)
+
+        # do gaussian opt
+        self.molecule.SetProp("_Name", filename)
+        output = qmxtb.xtb([self.molecule], method="opt", charge=0, mult=1, charged_fragments=True, cpus=1, keepFiles=True)
+
+        if output[0] is not None:
+            #print (output)
+
+            atoms = output[0]['atomicPos']
+
+            energykey = 'xTB_energy'
+            self.energy = float(output[0][energykey])
+            self.energy = self.energy * 627.15 # converts from hartree to kcal/mol
+            conf = self.molecule.GetConformer()
+            N = 0
+            # This assumes that the atom ordering is the same!!!!
+            for xyz in atoms: 
+                conf.SetAtomPosition(N, xyz)
+                N += 1
+        elif output[0] is None:
+            # xtb failed, set energy to a high number, this is kind of a hack
+            self.energy = 9999.0
+
     def optimise_gaussian(self, filename = "test"):
         """
         Optimise molecule with gaussian
         """
-        import qmgaussian
 
         # first do minimisation with MMFF94 and dihedrals contrainted
         # this will hopefully fix clashes
@@ -93,7 +142,6 @@ class Conformer:
         Gmethod = "pm6"
         output = qmgaussian.gaussian([self.molecule], method="opt " + Gmethod, charge=0, mult=1, charged_fragments=True, cpus=1, keepFiles=True)
 
-
         if output[0] is not None:
             atoms = output[0]['atomicPos']
 
@@ -107,7 +155,7 @@ class Conformer:
                 conf.SetAtomPosition(N, xyz)
                 N += 1
         elif output[0] is None:
-            # gaussian failed set energy to a high number, this is kind of a hack
+            # gaussian failed, set energy to a high number, this is kind of a hack
             self.energy = 9999.0
  
     def get_dihedrals(self):
@@ -161,6 +209,15 @@ class Conformer:
 
         self.dihedrals = list_of_changes
 
+    def sample_rings(self):
+
+        current_dihedrals = [x[4] for x in self.get_dihedrals()]
+        AllChem.EmbedMolecule(self.molecule, randomSeed=int(time.time()),  useRandomCoords=True)
+
+        self.set_dihedrals(current_dihedrals)
+
+
+
 class ConformerSearchBase:
     def __init__(self, smiles = 'CCCCC'):     
         """
@@ -203,6 +260,7 @@ class ConformerSearchBase:
         self.keep_stereochemistry = True
         self.original_conformer = None
         self.original_smiles = 'Empty'
+        self.ring_atoms_nr = 0
 
     def check_uniqueness(self, test_conformer, conformers_tocheck_against, angle_tolerance = 0.2, energy_tolerance = 0.0000001):
 
@@ -333,15 +391,14 @@ class ConformerSearchBase:
                 # somekind of bug here. Making the smiles from the mol object sometimes result in a wrong
                 # stereochemistry, but writing to a pdb file and the reading it produces the correct result
                 # this is a hack that should be fixed
-                temp_pdb_name = self.jobname + '_temp.pdb'
-                self.write_pdb(conformer.molecule, temp_pdb_name)
-                temp_mol = MolFromPDBFile(temp_pdb_name)
+                pdb_block = MolToPDBBlock(conformer.molecule)
+                temp_mol = MolFromPDBBlock(pdb_block)
                 test_smiles = self.get_smiles(temp_mol)
                 if self.original_smiles != test_smiles:
                     angles = ''
                     for angle in conformer.dihedrals:
                         angles += " %7.2f" % angle
-                    print ('Structure with invalid stereochemistry found. Energy: %10.8f' % (conformer.energy), ' Torsions: ' + angles + " Smiles: " + test_smiles )
+                    #print ('Structure with invalid stereochemistry found. Energy: %10.8f' % (conformer.energy), ' Torsions: ' + angles + " Smiles: " + test_smiles )
                     conformer.energy = 9999.0
             except:
                 # this is need to prevent rdkit from crashing if it cant understand the molecule
@@ -349,8 +406,8 @@ class ConformerSearchBase:
                 for angle in conformer.dihedrals:
                     angles += " %7.2f" % angle
                 #print ('Fail found. Energy: %10.8f' % (conformer.energy), ' Torsions: ' + angles )
-                temp_pdb_name = self.jobname + str(self.OPT_COUNT) + 'fail.pdb'
-                self.write_pdb(conformer.molecule, temp_pdb_name)
+                #temp_pdb_name = self.jobname + str(self.OPT_COUNT) + 'fail.pdb'
+                #self.write_pdb(conformer.molecule, temp_pdb_name)
                 conformer.energy = 9999.0
                 
 
@@ -358,7 +415,7 @@ class ConformerSearchBase:
             angles = ''
             for angle in conformer.dihedrals:
                 angles += " %7.2f" % angle
-            print ('Count:',"%6i" % (self.OPT_COUNT), 'Energy:',"%14.8f" % (conformer.energy), 'Torsions:', angles)
+            print ('OPT Count:',"%6i" % (self.OPT_COUNT), 'Energy:',"%14.8f" % (conformer.energy), 'Torsions:', angles)
 
             self.min_energy = conformer.energy
             self.min_conformer = conformer
@@ -367,6 +424,18 @@ class ConformerSearchBase:
  
         self.update_conformerslist(self.conformers, conformer, self.max_conformers)
         self.log.append((self.OPT_COUNT, self.min_energy))
+
+    def count_ringatoms(self, molecule):
+
+        ringbonds = molecule.GetSubstructMatches(Chem.MolFromSmarts("[r!a]~[r!a]"))
+        ring_atoms = []
+        for bond in ringbonds:
+            if bond[0] not in ring_atoms:
+                ring_atoms.append(bond[0])
+            if bond[1] not in ring_atoms:
+                ring_atoms.append(bond[1])
+        ring_atoms_number = len(ring_atoms)
+        return ring_atoms_number
 
     def init_search(self, smiles, algorithmname, algorithm_tag):
 
@@ -396,9 +465,13 @@ class ConformerSearchBase:
         Chem.AssignStereochemistry(mol, flagPossibleStereoCenters=True, force=True)
         Chem.AssignAtomChiralTagsFromStructure(mol,-1)
 
+        self.ring_atoms_nr = self.count_ringatoms(mol)
+        print ('Number of non aromatic ring atoms:',str(self.ring_atoms_nr))
+
         #create start conformer
         start_conformer = Conformer(mol)
-        start_conformer.update_molecule(self.method)
+        start_conformer.update_molecule('MMFF94')
+
         self.min_conformer = start_conformer
         self.min_energy = start_conformer.energy
         print ('Start energy:', self.min_energy)
@@ -424,8 +497,25 @@ class ConformerSearchBase:
         """
         new_conformers = []
         for conformer in conformers:
-            conformer.update_molecule(method)
-            self.OPT_COUNT += 1        
+            if method == "MMFF94":
+                conformer.update_molecule(method)
+                self.OPT_COUNT += 1        
+            elif method in ["gaussian","xtb"]:
+                p = MyPool(1)
+       
+                jobname = self.jobname
+                job = [(jobname, method, [conformer])]
+                parallel_output = p.imap(optimise_multiprocessing, job)
+
+                p.close()
+                p.join()
+
+                output = parallel_output.next()
+                conformer = output[0][0]
+                self.OPT_COUNT += output[1]
+            else:
+                print ('ERROR IN METHOD')
+
             self.update_search(conformer)
             new_conformers.append(conformer)
     
@@ -437,7 +527,6 @@ class ConformerSearchBase:
         Optimise the conformers in parallel using the multiprocessing module. 
         The conformers are divided into chunks for each CPU.
         """
-        #chunks = [conformers[i:i + chunk_size] for i in range(0, len(conformers), chunk_size)]       
         chunks = [ [] for x in range(cpu_nr) ]
         M = 0
         for conformer in conformers:
@@ -550,6 +639,11 @@ class MonteCarlo(ConformerSearchBase):
 
                 #sample dihedral angles
                 new_conformer = self.sample_dihedrals(new_conformer, self.mutation_rate)
+
+                if self.ring_atoms_nr >= 5:
+                    if np.random.uniform(0,1) < 0.10:
+                        new_conformer.sample_rings()
+
                 new_conformers.append(new_conformer)
 
             if self.cpu_nr == 1:
@@ -728,7 +822,7 @@ class GeneticAlgorithm(ConformerSearchBase):
 
         if (len(parent_A.dihedrals)-1) > 1:
 
-            cut = np.random.randint(1,len(parent_A.dihedrals)-1)
+            cut = np.random.randint(0,len(parent_A.dihedrals))
             child_angles = parent_A.dihedrals[:cut] + parent_B.dihedrals[cut:]
 
             new_molecule = Chem.Mol(parent_A.molecule)
@@ -797,6 +891,11 @@ class GeneticAlgorithm(ConformerSearchBase):
 
             population = self.reproduce(mating_pool, self.population_size, self.mutation_rate)
 
+            if self.ring_atoms_nr >= 5:
+                for conformer in population:
+                    if np.random.uniform(0,1) < 0.10:
+                        conformer.sample_rings()
+
             if self.cpu_nr == 1:
                 population = self.optimise_conformers_serial(population, self.method)
             elif self.cpu_nr > 1:
@@ -832,18 +931,18 @@ if __name__ == "__main__":
     def do_search(INPUT):
         tag = INPUT[0]
         smiles = INPUT[1]
-        total = 25
+        total = 5
         for i in range(0, total):
             search = MonteCarlo(smiles)
             #search = GeneticAlgorithm(smiles)
             search.jobname = tag + '_' + str(i)
             search.MAX_OPT_COUNT = 10000
-            search.temperature = 30
-            search.mutation_rate = 0.1
+            search.temperature = 300
+            search.mutation_rate = 0.3
             search.generations = 50000
             search.max_conformers = 25
             search.cpu_nr = 1
-            search.method = "MMFF94"
+            search.method = "xtb"
             search.run()
 
 
@@ -864,9 +963,25 @@ if __name__ == "__main__":
                    ["molecule_70" , r"CCCCCNC(=N)N/N=C/C1=CNC2C=CC(=CC1=2)OC"],
                    ["molecule_71" , r"COC1=CC(N)=C(Cl)C=C1C(=O)N[C@H]1CCN(C[C@H]1OC)CCCOC1C=CC(F)=CC=1"] )
 
-    NUMBER_OF_CPU = 16
-    #p = multiprocessing.Pool(NUMBER_OF_CPU)
-    #p.map(do_mc, all_smiles)
+    NUMBER_OF_CPU = 8
+   # p = multiprocessing.Pool(NUMBER_OF_CPU)
+   # p.map(do_search, all_smiles)
 
-    do_search(['test', r'CCCCCCCCCCC'])
+    p = MyPool(NUMBER_OF_CPU) # use multiprocessing wrapper
+    p.map(do_search, all_smiles)
+
+    #do_search(['test_0', r'CCCCCCCCCCC'])
+
+
+    #do_search(['test_27', r'CC(C)C[C@@H]1NC(=O)[C@H](C)N(C)C(=O)CNC(=O)/C(=C\C2C=CC=CC=2)/N(C)C1=O'])
+
+    #do_search(['test_13', r'C1C[C@](C)([C@@H]([C@@H](\C=C\[C@@H](C(C)C)C)C)CC2)[C@@H]2\C(=C\C=C(/C(=C)CC[C@@H]3O)\C3)\C1'])
+
+    #do_search(['test_100', r'CCCCC[C@H](O)/C=C/[C@@H]1[C@@H](C/C=C\CCCC(O)=O)[C@@H]2C[C@H]1OO2'])
+
+    #do_search(['test_71', r'COC1=CC(N)=C(Cl)C=C1C(=O)N[C@H]1CCN(C[C@H]1OC)CCCOC1C=CC(F)=CC=1'])
+
+    #do_search(['test_110', r'C[C@H](Cn1cnc2c1ncnc2N)OCP(=O)(OCOC(=O)OC(C)C)OCOC(=O)OC(C)C'])
+
+    #do_search(['test_105', r'CC(C)[C@@H](C(=O)N1CC2(CC2)C[C@H]1c3[nH]c(cn3)c4ccc-5c(c4)C(c6c5ccc(c6)c7ccc8c(c7)[nH]c(n8)[C@@H]9[C@H]1CC[C@H](C1)N9C(=O)[C@H](C(C)C)NC(=O)OC)(F)F)NC(=O)OC'])
 
